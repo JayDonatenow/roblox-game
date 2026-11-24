@@ -48,9 +48,6 @@ predatory/loot-box mechanics.
 3. Press Play.
 4. Create game passes/dev products in the Creator Dashboard and put the IDs in `ReplicatedStorage > Shared > Config`.
 
-Developers who prefer Rojo can use `default.project.json`. After editing anything in `src/`,
-regenerate the place file with `python3 tools/build_rbxlx.py`.
-
 ## Status
 v1 code is **untested**: written without Roblox Studio or a Luau runtime. Expect to fix small bugs
 on first run. Next step is running it in Studio.
