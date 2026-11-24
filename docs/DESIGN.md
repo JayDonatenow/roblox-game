@@ -42,11 +42,14 @@ predatory/loot-box mechanics.
 4. Events, leaderboards, daily rewards
 5. Offline earnings, auto-fuse pass
 
-## Setup
-1. Install [Rojo](https://rojo.space) and the Rojo Studio plugin.
-2. `rojo serve`, then connect from Studio. (Or `rojo build -o MutationLab.rbxlx` and open the file.)
-3. In Studio: Game Settings -> Security -> Enable Studio Access to API Services (for DataStores).
-4. Create game passes/dev products in the Creator Dashboard and put the IDs in `src/shared/Config.luau`.
+## Setup (no Rojo needed)
+1. Download `MutationLab.rbxlx` from the repo and open it in Roblox Studio (File > Open from File).
+2. Game Settings > Security > turn on "Enable Studio Access to API Services" (needed for saving).
+3. Press Play.
+4. Create game passes/dev products in the Creator Dashboard and put the IDs in `ReplicatedStorage > Shared > Config`.
+
+Developers who prefer Rojo can use `default.project.json`. After editing anything in `src/`,
+regenerate the place file with `python3 tools/build_rbxlx.py`.
 
 ## Status
 v1 code is **untested**: written without Roblox Studio or a Luau runtime. Expect to fix small bugs

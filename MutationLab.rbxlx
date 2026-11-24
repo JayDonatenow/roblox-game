@@ -1,0 +1,892 @@
+<roblox version="4"><Item class="Workspace" referent="RBX0000000000000000000000000000000C"><Properties></Properties><Item class="Part" referent="RBX00000000000000000000000000000001"><Properties><string name="Name">Baseplate</string><bool name="Anchored">true</bool><Vector3 name="size"><X>512</X><Y>20</Y><Z>512</Z></Vector3><CoordinateFrame name="CFrame"><X>0</X><Y>-10</Y><Z>0</Z><R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12><R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame></Properties></Item><Item class="SpawnLocation" referent="RBX00000000000000000000000000000002"><Properties><string name="Name">SpawnLocation</string><bool name="Anchored">true</bool><Vector3 name="size"><X>12</X><Y>1</Y><Z>12</Z></Vector3><CoordinateFrame name="CFrame"><X>0</X><Y>0.5</Y><Z>0</Z><R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12><R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame></Properties></Item></Item><Item class="ReplicatedStorage" referent="RBX0000000000000000000000000000000D"><Properties></Properties><Item class="Folder" referent="RBX00000000000000000000000000000006"><Properties><string name="Name">Shared</string></Properties><Item class="ModuleScript" referent="RBX00000000000000000000000000000003"><Properties><string name="Name">Config</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Central tuning values. Change numbers here, not in the services.
+
+local Config = {}
+
+Config.StartingCoins = 100
+Config.StartingSlots = 4
+Config.MaxSlots = 24
+Config.SlotBaseCost = 250 -- cost of slot N = SlotBaseCost * SlotCostGrowth^(N - StartingSlots - 1)
+Config.SlotCostGrowth = 1.9
+
+Config.MaxTier = 8
+Config.FusionBaseCost = 50 -- coins; multiplied by FusionCostPerTier^tier of the higher parent
+Config.FusionCostPerTier = 2.2
+Config.FusionBaseSeconds = 10 -- timer; multiplied by FusionTimePerTier^tier
+Config.FusionTimePerTier = 1.8
+Config.TierUpChance = 0.35 -- chance a fusion produces a creature one tier above its best parent
+
+-- Income per second for a creature = TierBaseIncome * 2^(tier-1) * (1 + sum of trait bonuses)
+Config.TierBaseIncome = 1
+
+Config.SkipTimerRobuxPerMinute = 5 -- only used to scale the dev-product tiers below
+
+-- Fill these with real IDs after creating products in the Creator Dashboard.
+-- Game passes: https://create.roblox.com -> your experience -> Monetization
+Config.GamePasses = {
+	AutoFuse = 0, -- 2x speed + auto re-fuse a favorite recipe
+	DoubleIncome = 0, -- permanent 2x coins
+	ExtraSlots = 0, -- +6 lab slots
+}
+
+Config.DevProducts = {
+	SkipTimer = 0, -- instantly finish one fusion
+	StarterPack = 0, -- one time: coins + exclusive "Prototype" creature
+	CoinBoost = 0, -- 15 min of 2x coins
+}
+
+Config.StarterPackCoins = 1000
+Config.StarterPackCreature = "Prototype Blob"
+
+return Config
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000000000000000000000000000004"><Properties><string name="Name">Creatures</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Base (tier 1) species. Everything else in the game is discovered by fusing these.
+
+export type Species = {
+	name: string,
+	emoji: string,
+}
+
+local Creatures = {}
+
+Creatures.BaseSpecies = {
+	{ name = "Slime", emoji = "🟢" },
+	{ name = "Ember", emoji = "🔥" },
+	{ name = "Frost", emoji = "❄️" },
+	{ name = "Spark", emoji = "⚡" },
+	{ name = "Moss", emoji = "🌿" },
+	{ name = "Void", emoji = "🌑" },
+	{ name = "Crystal", emoji = "💎" },
+	{ name = "Gloom", emoji = "👻" },
+} :: { Species }
+
+-- Traits are random rolls on a fusion result. bonus is added to the income multiplier.
+Creatures.Traits = {
+	{ name = "Glowing", bonus = 0.25 },
+	{ name = "Giant", bonus = 0.40 },
+	{ name = "Tiny", bonus = 0.10 },
+	{ name = "Shiny", bonus = 0.60 },
+	{ name = "Spiky", bonus = 0.20 },
+	{ name = "Rainbow", bonus = 1.00 },
+}
+
+Creatures.TierNames = {
+	"Common",
+	"Uncommon",
+	"Rare",
+	"Epic",
+	"Legendary",
+	"Mythic",
+	"Cosmic",
+	"Impossible",
+}
+
+return Creatures
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000000000000000000000000000005"><Properties><string name="Name">Fusion</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Pure, deterministic fusion logic shared by server (authority) and client (preview).
+--
+-- KEY DESIGN RULE: the same two parents ALWAYS give the same result, for every
+-- player on every server. That makes recipes discoverable and shareable
+-- ("Slime + Void = Shiny Voidslime!") which is the whole viral hook.
+
+local Config = require(script.Parent.Config)
+local Creatures = require(script.Parent.Creatures)
+
+export type Creature = {
+	id: string,
+	name: string,
+	tier: number,
+	traits: { string },
+	parents: { string }?, -- ids of the two parents, nil for base species
+}
+
+local Fusion = {}
+
+-- 32-bit FNV-1a. Deterministic across platforms.
+local function hash(s: string): number
+	local h = 2166136261
+	for i = 1, #s do
+		h = bit32.bxor(h, string.byte(s, i))
+		h = (h * 16777619) % 4294967296
+	end
+	return h
+end
+
+-- Small deterministic PRNG (xorshift) so we do not depend on Random's seeding.
+local function makeRng(seed: number)
+	local state = if seed == 0 then 1 else seed
+	return function(): number -- returns [0, 1)
+		state = bit32.bxor(state, bit32.lshift(state, 13))
+		state = bit32.bxor(state, bit32.rshift(state, 17))
+		state = bit32.bxor(state, bit32.lshift(state, 5))
+		return state / 4294967296
+	end
+end
+
+function Fusion.makeBase(speciesName: string): Creature
+	return { id = speciesName, name = speciesName, tier = 1, traits = {} }
+end
+
+function Fusion.recipeKey(a: Creature, b: Creature): string
+	if a.id <= b.id then
+		return a.id .. "+" .. b.id
+	end
+	return b.id .. "+" .. a.id
+end
+
+local function blendName(a: string, b: string, rng: () -> number): string
+	-- first half of one name + second half of the other, e.g. Slime+Void -> "Slioid"
+	local first, second = a, b
+	if rng() < 0.5 then
+		first, second = b, a
+	end
+	local cutA = math.max(2, math.ceil(#first / 2))
+	local cutB = math.max(2, math.floor(#second / 2))
+	local name = string.sub(first, 1, cutA) .. string.lower(string.sub(second, -cutB))
+	return name
+end
+
+-- Deterministic result of fusing a and b.
+function Fusion.fuse(a: Creature, b: Creature): Creature
+	local key = Fusion.recipeKey(a, b)
+	local h = hash(key)
+	local rng = makeRng(h)
+
+	local tier = math.max(a.tier, b.tier)
+	if rng() < Config.TierUpChance and tier < Config.MaxTier then
+		tier += 1
+	end
+
+	local traitList = {}
+	-- inherit up to one trait from parents, then maybe roll a new one
+	local pool: { string } = {}
+	for _, t in a.traits do
+		table.insert(pool, t)
+	end
+	for _, t in b.traits do
+		table.insert(pool, t)
+	end
+	if #pool > 0 and rng() < 0.5 then
+		table.insert(traitList, pool[math.floor(rng() * #pool) + 1])
+	end
+	if rng() < 0.45 then
+		local t = Creatures.Traits[math.floor(rng() * #Creatures.Traits) + 1].name
+		if not table.find(traitList, t) then
+			table.insert(traitList, t)
+		end
+	end
+
+	local name = blendName(a.name, b.name, rng)
+	return {
+		id = string.format("%s-%08x", name, h),
+		name = name,
+		tier = tier,
+		traits = traitList,
+		parents = { a.id, b.id },
+	}
+end
+
+local function traitBonus(traitName: string): number
+	for _, t in Creatures.Traits do
+		if t.name == traitName then
+			return t.bonus
+		end
+	end
+	return 0
+end
+
+function Fusion.incomePerSecond(c: Creature): number
+	local mult = 1
+	for _, t in c.traits do
+		mult += traitBonus(t)
+	end
+	return Config.TierBaseIncome * 2 ^ (c.tier - 1) * mult
+end
+
+function Fusion.cost(a: Creature, b: Creature): number
+	local tier = math.max(a.tier, b.tier)
+	return math.floor(Config.FusionBaseCost * Config.FusionCostPerTier ^ (tier - 1))
+end
+
+function Fusion.seconds(a: Creature, b: Creature): number
+	local tier = math.max(a.tier, b.tier)
+	return math.floor(Config.FusionBaseSeconds * Config.FusionTimePerTier ^ (tier - 1))
+end
+
+function Fusion.tierName(tier: number): string
+	return Creatures.TierNames[tier] or "Unknown"
+end
+
+return Fusion
+]]></ProtectedString></Properties></Item></Item></Item><Item class="ServerScriptService" referent="RBX0000000000000000000000000000000E"><Properties></Properties><Item class="Folder" referent="RBX0000000000000000000000000000000A"><Properties><string name="Name">Server</string></Properties><Item class="Script" referent="RBX00000000000000000000000000000007"><Properties><string name="Name">Main</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Server entry point: remotes, economy loop, fusion, monetization.
+-- The server is the ONLY authority on coins, creatures and timers. Clients just ask.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local Config = require(ReplicatedStorage.Shared.Config)
+local Fusion = require(ReplicatedStorage.Shared.Fusion)
+local Creatures = require(ReplicatedStorage.Shared.Creatures)
+local PlayerData = require(script.Parent.PlayerData)
+local DiscoveryLog = require(script.Parent.DiscoveryLog)
+
+-- Remotes ---------------------------------------------------------------
+local remotes = Instance.new("Folder")
+remotes.Name = "Remotes"
+remotes.Parent = ReplicatedStorage
+
+local function makeEvent(name: string): RemoteEvent
+	local e = Instance.new("RemoteEvent")
+	e.Name = name
+	e.Parent = remotes
+	return e
+end
+
+local StateChanged = makeEvent("StateChanged") -- server -> client: full state snapshot
+local Announce = makeEvent("Announce") -- server -> all clients: discovery messages
+local FusionResult = makeEvent("FusionResult") -- server -> client: reveal animation data
+local Action = Instance.new("RemoteFunction") -- client -> server: all requests
+Action.Name = "Action"
+Action.Parent = remotes
+
+-- Helpers ---------------------------------------------------------------
+local function incomeMultiplier(profile: PlayerData.Profile): number
+	local m = 1
+	if profile.passes.DoubleIncome then
+		m *= 2
+	end
+	if os.time() < profile.boostUntil then
+		m *= 2
+	end
+	return m
+end
+
+local function totalIncome(profile: PlayerData.Profile): number
+	local sum = 0
+	for _, id in profile.lab do
+		local c = profile.known[id]
+		if c then
+			sum += Fusion.incomePerSecond(c)
+		end
+	end
+	return sum * incomeMultiplier(profile)
+end
+
+local function maxSlots(profile: PlayerData.Profile): number
+	local extra = if profile.passes.ExtraSlots then 6 else 0
+	return math.min(profile.slots + extra, Config.MaxSlots + extra)
+end
+
+local function snapshot(profile: PlayerData.Profile)
+	return {
+		coins = profile.coins,
+		slots = maxSlots(profile),
+		known = profile.known,
+		inventory = profile.inventory,
+		lab = profile.lab,
+		fusion = profile.fusion,
+		income = totalIncome(profile),
+		boostUntil = profile.boostUntil,
+		serverTime = os.time(),
+		slotCost = math.floor(Config.SlotBaseCost * Config.SlotCostGrowth ^ (profile.slots - Config.StartingSlots)),
+		discoveredCount = (function()
+			local n = 0
+			for _ in profile.discovered do
+				n += 1
+			end
+			return n
+		end)(),
+	}
+end
+
+local function push(player: Player)
+	local profile = PlayerData.get(player)
+	if profile then
+		StateChanged:FireClient(player, snapshot(profile))
+	end
+end
+
+local function addToInventory(profile: PlayerData.Profile, c: Fusion.Creature, n: number)
+	profile.known[c.id] = c
+	profile.inventory[c.id] = (profile.inventory[c.id] or 0) + n
+end
+
+local function takeFromInventory(profile: PlayerData.Profile, id: string, n: number): boolean
+	local have = profile.inventory[id] or 0
+	if have < n then
+		return false
+	end
+	profile.inventory[id] = if have == n then nil else have - n
+	return true
+end
+
+-- Actions ---------------------------------------------------------------
+local handlers: { [string]: (Player, PlayerData.Profile, any) -> (boolean, string?) } = {}
+
+handlers.BuyBase = function(_, profile, args)
+	local name = args and args.name
+	local price = 25
+	for _, s in Creatures.BaseSpecies do
+		if s.name == name then
+			if profile.coins < price then
+				return false, "Not enough coins"
+			end
+			profile.coins -= price
+			addToInventory(profile, Fusion.makeBase(s.name), 1)
+			return true
+		end
+	end
+	return false, "Unknown species"
+end
+
+handlers.Place = function(_, profile, args)
+	local id = args and args.id
+	if typeof(id) ~= "string" then
+		return false, "Bad id"
+	end
+	if #profile.lab >= maxSlots(profile) then
+		return false, "Lab is full"
+	end
+	if not takeFromInventory(profile, id, 1) then
+		return false, "You don't have that"
+	end
+	table.insert(profile.lab, id)
+	return true
+end
+
+handlers.Unplace = function(_, profile, args)
+	local id = args and args.id
+	local idx = if typeof(id) == "string" then table.find(profile.lab, id) else nil
+	if not idx then
+		return false, "Not in lab"
+	end
+	table.remove(profile.lab, idx)
+	profile.inventory[id] = (profile.inventory[id] or 0) + 1
+	return true
+end
+
+handlers.BuySlot = function(_, profile)
+	if profile.slots >= Config.MaxSlots then
+		return false, "Max slots"
+	end
+	local cost = math.floor(Config.SlotBaseCost * Config.SlotCostGrowth ^ (profile.slots - Config.StartingSlots))
+	if profile.coins < cost then
+		return false, "Not enough coins"
+	end
+	profile.coins -= cost
+	profile.slots += 1
+	return true
+end
+
+handlers.StartFusion = function(_, profile, args)
+	if profile.fusion then
+		return false, "Fusion already running"
+	end
+	local aId, bId = args and args.a, args and args.b
+	if typeof(aId) ~= "string" or typeof(bId) ~= "string" then
+		return false, "Bad ids"
+	end
+	local a, b = profile.known[aId], profile.known[bId]
+	if not a or not b then
+		return false, "Unknown creature"
+	end
+	-- need two distinct copies (or 2 of the same id)
+	local needed = if aId == bId then 2 else 1
+	if (profile.inventory[aId] or 0) < needed or (profile.inventory[bId] or 0) < needed then
+		return false, "You need both creatures in your inventory"
+	end
+	local cost = Fusion.cost(a, b)
+	if profile.coins < cost then
+		return false, "Need " .. cost .. " coins"
+	end
+	profile.coins -= cost
+	takeFromInventory(profile, aId, 1)
+	takeFromInventory(profile, bId, 1)
+	local result = Fusion.fuse(a, b)
+	profile.fusion = {
+		a = aId,
+		b = bId,
+		resultId = result.id,
+		finishAt = os.time() + Fusion.seconds(a, b),
+	}
+	profile.known[result.id] = result -- stored now, but not revealed until claimed
+	return true
+end
+
+local function finishFusion(player: Player, profile: PlayerData.Profile)
+	local f = profile.fusion
+	if not f then
+		return false, "Nothing to claim"
+	end
+	local result = profile.known[f.resultId]
+	local a, b = profile.known[f.a], profile.known[f.b]
+	profile.fusion = nil
+	addToInventory(profile, result, 1)
+
+	local recipeKey = Fusion.recipeKey(a, b)
+	local newForPlayer = not profile.discovered[recipeKey]
+	profile.discovered[recipeKey] = true
+
+	local first = false
+	if newForPlayer then
+		first = DiscoveryLog.claim(recipeKey, player.UserId, player.Name, result.name)
+	end
+	FusionResult:FireClient(player, {
+		creature = result,
+		parents = { a.name, b.name },
+		isNewRecipe = newForPlayer,
+		isWorldFirst = first,
+		income = Fusion.incomePerSecond(result),
+	})
+	if first then
+		Announce:FireAllClients(
+			string.format("🧪 %s just discovered %s (%s)!", player.Name, result.name, Fusion.tierName(result.tier))
+		)
+	end
+	return true
+end
+
+handlers.ClaimFusion = function(player, profile)
+	local f = profile.fusion
+	if not f then
+		return false, "Nothing to claim"
+	end
+	if os.time() < f.finishAt then
+		return false, "Still fusing"
+	end
+	return finishFusion(player, profile)
+end
+
+Action.OnServerInvoke = function(player: Player, name: any, args: any)
+	local profile = PlayerData.get(player)
+	local handler = if typeof(name) == "string" then handlers[name] else nil
+	if not profile or not handler then
+		return { ok = false, err = "Bad request" }
+	end
+	local ok, err = handler(player, profile, args)
+	push(player)
+	return { ok = ok, err = err }
+end
+
+-- Income loop -----------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(1)
+		for player, profile in PlayerData.all() do
+			profile.coins += totalIncome(profile)
+			push(player)
+		end
+	end
+end)
+
+-- Monetization ----------------------------------------------------------
+local function refreshPasses(player: Player, profile: PlayerData.Profile)
+	for name, id in Config.GamePasses do
+		if id ~= 0 then
+			local ok, owns = pcall(function()
+				return MarketplaceService:UserOwnsGamePassAsync(player.UserId, id)
+			end)
+			if ok then
+				profile.passes[name] = owns
+			end
+		end
+	end
+end
+
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, passId, purchased)
+	if purchased then
+		local profile = PlayerData.get(player)
+		if profile then
+			refreshPasses(player, profile)
+			push(player)
+		end
+	end
+end)
+
+MarketplaceService.ProcessReceipt = function(info)
+	local player = Players:GetPlayerByUserId(info.PlayerId)
+	if not player then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+	local profile = PlayerData.get(player)
+	if not profile then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+	local receiptId = tostring(info.PurchaseId)
+	if profile.receipts[receiptId] then
+		return Enum.ProductPurchaseDecision.PurchaseGranted -- already granted
+	end
+
+	local id = info.ProductId
+	if id == Config.DevProducts.SkipTimer and id ~= 0 then
+		if profile.fusion then
+			profile.fusion.finishAt = os.time()
+		end
+	elseif id == Config.DevProducts.StarterPack and id ~= 0 then
+		if profile.starterPackBought then
+			return Enum.ProductPurchaseDecision.PurchaseGranted
+		end
+		profile.starterPackBought = true
+		profile.coins += Config.StarterPackCoins
+		local c = Fusion.makeBase(Config.StarterPackCreature)
+		c.tier = 3
+		c.traits = { "Rainbow" }
+		addToInventory(profile, c, 1)
+	elseif id == Config.DevProducts.CoinBoost and id ~= 0 then
+		profile.boostUntil = math.max(profile.boostUntil, os.time()) + 15 * 60
+	else
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	profile.receipts[receiptId] = true
+	PlayerData.save(player) -- save immediately after a purchase
+	push(player)
+	return Enum.ProductPurchaseDecision.PurchaseGranted
+end
+
+-- Player lifecycle ------------------------------------------------------
+Players.PlayerAdded:Connect(function(player)
+	local profile = PlayerData.load(player)
+	refreshPasses(player, profile)
+	push(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	PlayerData.release(player)
+end)
+
+for _, player in Players:GetPlayers() do
+	task.spawn(function()
+		local profile = PlayerData.load(player)
+		refreshPasses(player, profile)
+		push(player)
+	end)
+end
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000000000000000000000000000008"><Properties><string name="Name">PlayerData</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Loads/saves each player's profile. v1 uses plain DataStore (no session locking);
+-- swap in ProfileService/ProfileStore before launch if you expect lots of server hopping.
+
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Config = require(game.ReplicatedStorage.Shared.Config)
+local Fusion = require(game.ReplicatedStorage.Shared.Fusion)
+local Creatures = require(game.ReplicatedStorage.Shared.Creatures)
+
+export type Profile = {
+	coins: number,
+	slots: number,
+	known: { [string]: Fusion.Creature }, -- every creature the player has ever owned/discovered
+	inventory: { [string]: number }, -- id -> count (not placed in lab)
+	lab: { string }, -- ids placed in lab slots, earning income
+	discovered: { [string]: boolean }, -- recipe keys the player has discovered
+	fusion: { a: string, b: string, resultId: string, finishAt: number }?,
+	boostUntil: number, -- os.time() when CoinBoost ends
+	passes: { [string]: boolean }, -- cached game pass ownership
+	receipts: { [string]: boolean },
+	starterPackBought: boolean,
+}
+
+local store = DataStoreService:GetDataStore("MutationLab_v1")
+local profiles: { [Player]: Profile } = {}
+
+local PlayerData = {}
+
+local function newProfile(): Profile
+	local known = {}
+	local inventory = {}
+	for _, name in { "Slime", "Ember" } do
+		known[name] = Fusion.makeBase(name)
+		inventory[name] = 2
+	end
+	return {
+		coins = Config.StartingCoins,
+		slots = Config.StartingSlots,
+		known = known,
+		inventory = inventory,
+		lab = {},
+		discovered = {},
+		fusion = nil,
+		boostUntil = 0,
+		passes = {},
+		receipts = {},
+		starterPackBought = false,
+	}
+end
+
+local function key(player: Player): string
+	return "Player_" .. player.UserId
+end
+
+function PlayerData.load(player: Player): Profile
+	local ok, data = pcall(function()
+		return store:GetAsync(key(player))
+	end)
+	local profile = newProfile()
+	if ok and typeof(data) == "table" then
+		-- merge saved values over defaults so new fields added later don't break old saves
+		for k, v in data do
+			(profile :: any)[k] = v
+		end
+	elseif not ok then
+		warn("DataStore load failed for", player.Name, data)
+		-- Don't let a failed load overwrite their real save later.
+		player:Kick("Could not load your data. Please rejoin in a minute.")
+	end
+	profiles[player] = profile
+	return profile
+end
+
+function PlayerData.save(player: Player)
+	local profile = profiles[player]
+	if not profile then
+		return
+	end
+	local ok, err = pcall(function()
+		store:SetAsync(key(player), profile)
+	end)
+	if not ok then
+		warn("DataStore save failed for", player.Name, err)
+	end
+end
+
+function PlayerData.get(player: Player): Profile?
+	return profiles[player]
+end
+
+function PlayerData.release(player: Player)
+	PlayerData.save(player)
+	profiles[player] = nil
+end
+
+function PlayerData.all(): { [Player]: Profile }
+	return profiles
+end
+
+-- autosave every 2 minutes
+task.spawn(function()
+	while true do
+		task.wait(120)
+		for player in profiles do
+			PlayerData.save(player)
+		end
+	end
+end)
+
+game:BindToClose(function()
+	if RunService:IsStudio() then
+		return
+	end
+	for _, player in Players:GetPlayers() do
+		PlayerData.save(player)
+	end
+end)
+
+return PlayerData
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000000000000000000000000000009"><Properties><string name="Name">DiscoveryLog</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Global "first to discover" log. The first player in the world to make a recipe
+-- is recorded forever, and shown to everyone ("Discovered by <name>!").
+-- This is the social/viral hook: players brag about and share their finds.
+
+local DataStoreService = game:GetService("DataStoreService")
+
+local store = DataStoreService:GetDataStore("MutationLab_Discoveries_v1")
+
+local DiscoveryLog = {}
+
+export type Entry = { userId: number, name: string, creature: string, at: number }
+
+-- Returns (isFirstEver, entry). Safe to call on every fusion; only the first caller wins.
+function DiscoveryLog.claim(recipeKey: string, userId: number, playerName: string, creatureName: string): (boolean, Entry?)
+	local won = false
+	local ok, result = pcall(function()
+		return store:UpdateAsync(recipeKey, function(old)
+			if old ~= nil then
+				return nil -- cancel write, someone already discovered it
+			end
+			won = true
+			return { userId = userId, name = playerName, creature = creatureName, at = os.time() }
+		end)
+	end)
+	if not ok then
+		warn("DiscoveryLog failed:", result)
+		return false, nil
+	end
+	return won, result
+end
+
+function DiscoveryLog.lookup(recipeKey: string): Entry?
+	local ok, result = pcall(function()
+		return store:GetAsync(recipeKey)
+	end)
+	if ok then
+		return result
+	end
+	return nil
+end
+
+return DiscoveryLog
+]]></ProtectedString></Properties></Item></Item></Item><Item class="StarterPlayer" referent="RBX00000000000000000000000000000010"><Properties></Properties><Item class="StarterPlayerScripts" referent="RBX0000000000000000000000000000000F"><Properties></Properties><Item class="LocalScript" referent="RBX0000000000000000000000000000000B"><Properties><string name="Name">UI</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Minimal programmatic UI (no Studio assets needed) so the prototype runs immediately.
+-- Replace with a designed UI later; all logic lives on the server.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Fusion = require(ReplicatedStorage.Shared.Fusion)
+local Creatures = require(ReplicatedStorage.Shared.Creatures)
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local StateChanged = remotes:WaitForChild("StateChanged") :: RemoteEvent
+local Announce = remotes:WaitForChild("Announce") :: RemoteEvent
+local FusionResult = remotes:WaitForChild("FusionResult") :: RemoteEvent
+local Action = remotes:WaitForChild("Action") :: RemoteFunction
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MutationLabUI"
+gui.ResetOnSpawn = false
+gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+local function label(parent: Instance, text: string, size: UDim2, pos: UDim2): TextLabel
+	local l = Instance.new("TextLabel")
+	l.Size, l.Position, l.Text = size, pos, text
+	l.BackgroundTransparency = 1
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.GothamBold
+	l.TextScaled = true
+	l.Parent = parent
+	return l
+end
+
+local function button(parent: Instance, text: string, size: UDim2, pos: UDim2, onClick: () -> ()): TextButton
+	local b = Instance.new("TextButton")
+	b.Size, b.Position, b.Text = size, pos, text
+	b.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextScaled = true
+	b.Parent = parent
+	Instance.new("UICorner").Parent = b
+	b.Activated:Connect(onClick)
+	return b
+end
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromScale(0.5, 0.6)
+panel.Position = UDim2.fromScale(0.25, 0.2)
+panel.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+panel.Parent = gui
+Instance.new("UICorner").Parent = panel
+
+local header = label(panel, "Coins: 0", UDim2.fromScale(0.6, 0.08), UDim2.fromScale(0.02, 0.01))
+header.TextXAlignment = Enum.TextXAlignment.Left
+local incomeLabel = label(panel, "+0/s", UDim2.fromScale(0.3, 0.08), UDim2.fromScale(0.68, 0.01))
+local fusionLabel = label(panel, "Pick two creatures to fuse", UDim2.fromScale(0.96, 0.07), UDim2.fromScale(0.02, 0.1))
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.fromScale(0.96, 0.55)
+list.Position = UDim2.fromScale(0.02, 0.18)
+list.BackgroundTransparency = 1
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = panel
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 4)
+layout.Parent = list
+
+local banner = label(gui, "", UDim2.fromScale(0.6, 0.06), UDim2.fromScale(0.2, 0.02))
+banner.TextColor3 = Color3.fromRGB(255, 220, 90)
+
+local state: any = nil
+local picks: { string } = {}
+local clockOffset = 0
+
+local function act(name: string, args: any?)
+	local res = Action:InvokeServer(name, args)
+	if not res.ok and res.err then
+		banner.Text = res.err
+		task.delay(3, function()
+			if banner.Text == res.err then
+				banner.Text = ""
+			end
+		end)
+	end
+end
+
+local function describe(c: any): string
+	local traits = if #c.traits > 0 then " [" .. table.concat(c.traits, ", ") .. "]" else ""
+	return string.format("%s  T%d %s%s  (+%.1f/s)", c.name, c.tier, Fusion.tierName(c.tier), traits, Fusion.incomePerSecond(c))
+end
+
+local function render()
+	if not state then
+		return
+	end
+	header.Text = string.format("Coins: %d", math.floor(state.coins))
+	incomeLabel.Text = string.format("+%.1f/s", state.income)
+
+	for _, child in list:GetChildren() do
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
+	end
+
+	if state.fusion then
+		local left = state.fusion.finishAt - (os.time() + clockOffset)
+		if left > 0 then
+			fusionLabel.Text = string.format("Fusing... %ds left", left)
+		else
+			fusionLabel.Text = "Fusion ready!"
+			button(list, "CLAIM RESULT", UDim2.new(1, 0, 0, 40), UDim2.new(), function()
+				act("ClaimFusion")
+			end).BackgroundColor3 = Color3.fromRGB(60, 190, 90)
+		end
+	else
+		fusionLabel.Text = if #picks == 0 then "Pick two creatures to fuse" else "Picked: " .. table.concat(picks, " + ")
+	end
+
+	for id, count in state.inventory do
+		local c = state.known[id]
+		if c then
+			button(list, string.format("%s  x%d", describe(c), count), UDim2.new(1, 0, 0, 36), UDim2.new(), function()
+				table.insert(picks, id)
+				if #picks == 2 then
+					local a, b = picks[1], picks[2]
+					picks = {}
+					act("StartFusion", { a = a, b = b })
+				else
+					render()
+				end
+			end)
+		end
+	end
+
+	for _, s in Creatures.BaseSpecies do
+		button(list, string.format("Buy %s %s (25)", s.emoji, s.name), UDim2.new(1, 0, 0, 30), UDim2.new(), function()
+			act("BuyBase", { name = s.name })
+		end).BackgroundColor3 = Color3.fromRGB(90, 90, 110)
+	end
+end
+
+StateChanged.OnClientEvent:Connect(function(newState)
+	state = newState
+	clockOffset = newState.serverTime - os.time()
+	render()
+end)
+
+Announce.OnClientEvent:Connect(function(msg: string)
+	banner.Text = msg
+	task.delay(6, function()
+		if banner.Text == msg then
+			banner.Text = ""
+		end
+	end)
+end)
+
+FusionResult.OnClientEvent:Connect(function(r)
+	local prefix = if r.isWorldFirst then "🌍 WORLD FIRST! " elseif r.isNewRecipe then "✨ New recipe! " else ""
+	banner.Text = prefix .. r.parents[1] .. " + " .. r.parents[2] .. " = " .. r.creature.name
+end)
+]]></ProtectedString></Properties></Item></Item></Item></roblox>
