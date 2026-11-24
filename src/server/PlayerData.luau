@@ -26,6 +26,7 @@ export type Profile = {
 
 local store = DataStoreService:GetDataStore("MutationLab_v1")
 local profiles: { [Player]: Profile } = {}
+local failedLoad: { [Player]: boolean } = {}
 
 local PlayerData = {}
 
@@ -67,8 +68,11 @@ function PlayerData.load(player: Player): Profile
 		end
 	elseif not ok then
 		warn("DataStore load failed for", player.Name, data)
-		-- Don't let a failed load overwrite their real save later.
-		player:Kick("Could not load your data. Please rejoin in a minute.")
+		-- Never save over a real profile we failed to load.
+		failedLoad[player] = true
+		if not RunService:IsStudio() then
+			player:Kick("Could not load your data. Please rejoin in a minute.")
+		end
 	end
 	profiles[player] = profile
 	return profile
@@ -76,7 +80,7 @@ end
 
 function PlayerData.save(player: Player)
 	local profile = profiles[player]
-	if not profile then
+	if not profile or failedLoad[player] then
 		return
 	end
 	local ok, err = pcall(function()
